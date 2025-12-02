@@ -1,0 +1,117 @@
+deploy:
+  stage: deploy
+  image: ubuntu:22.04
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $FORCE_DEPLOY == "true"'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main" && $FORCE_BUILD_ALL == "true"'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - .gitlab-ci.yml
+        - .gitlab-deploy.yml
+        - deployment/**/*
+        - backend/**/*
+        - frontend/**/*
+        - README.md
+      when: on_success
+    - when: never
+  variables:
+    ENV_FILE: .env
+    COMPOSE_FILE: deployment/docker/docker-compose-cicd.yml
+    SERVICES_TO_PULL: backend frontend
+  before_script:
+    - apt-get update -y -qq
+    - apt-get install -y -qq ssh git
+    - update-ca-certificates || true
+    - eval "$(ssh-agent -s)"
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H "$DEPLOY_SERVER" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      set -euo pipefail
+      export DEPLOY_PATH="$DEPLOY_PATH"
+      export CI_REPOSITORY_URL="$CI_REPOSITORY_URL"
+
+      if [ -d "\$DEPLOY_PATH/.git" ]; then
+        cd "\$DEPLOY_PATH"
+        git fetch origin main
+        git reset --hard origin/main
+        git clean -fd
+      else
+        rm -rf "\$DEPLOY_PATH"
+        git clone "\$CI_REPOSITORY_URL" "\$DEPLOY_PATH"
+        cd "\$DEPLOY_PATH"
+        git checkout main
+      fi
+      EOF
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      set -euo pipefail
+      cd "$DEPLOY_PATH"
+
+      # Обновляем IMAGE_TAG и REGISTRY_IMAGE в .env
+      sed -i '/^IMAGE_TAG=/d' .env
+      sed -i '/^REGISTRY_IMAGE=/d' .env
+      echo "IMAGE_TAG=$CI_COMMIT_SHA" >> .env
+      echo "REGISTRY_IMAGE=$CI_REGISTRY_IMAGE" >> .env
+
+      echo "=== Updated .env ==="
+      grep -E "^(IMAGE_TAG|REGISTRY_IMAGE)=" .env
+      EOF
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      set -euo pipefail
+      export DEPLOY_PATH="$DEPLOY_PATH"
+      export CI_REGISTRY="$CI_REGISTRY"
+      export CI_JOB_TOKEN="$CI_JOB_TOKEN"
+
+      cd "\$DEPLOY_PATH"
+      echo "\$CI_JOB_TOKEN" | docker login "\$CI_REGISTRY" -u gitlab-ci-token --password-stdin
+      EOF
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      set -euo pipefail
+      export DEPLOY_PATH="$DEPLOY_PATH"
+      export COMPOSE_FILE="$COMPOSE_FILE"
+      export SERVICES_TO_PULL="$SERVICES_TO_PULL"
+
+      cd "\$DEPLOY_PATH"
+      docker compose --env-file .env -f "\$COMPOSE_FILE" pull \$SERVICES_TO_PULL
+      EOF
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      set -euo pipefail
+      export DEPLOY_PATH="$DEPLOY_PATH"
+      export COMPOSE_FILE="$COMPOSE_FILE"
+
+      cd "\$DEPLOY_PATH"
+      docker compose --env-file .env -f "\$COMPOSE_FILE" up -d
+      EOF
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      set -euo pipefail
+      
+      echo "=== Restarting monitoring stack ==="
+      docker restart prometheus postgres-exporter nginx-exporter grafana || true
+      
+      echo "=== Waiting for services ==="
+      sleep 8
+      EOF
+      
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_SERVER" "bash -s" << EOF
+      export DEPLOY_PATH="$DEPLOY_PATH"
+      export COMPOSE_FILE="$COMPOSE_FILE"
+
+      cd "\$DEPLOY_PATH"
+      docker compose --env-file .env -f "\$COMPOSE_FILE" ps
+      EOF
+
+  environment:
+    name: main
+  allow_failure: false

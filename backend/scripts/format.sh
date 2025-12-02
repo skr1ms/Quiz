@@ -1,0 +1,6 @@
+#!/bin/sh -e
+set -x
+
+ruff check --fix src tests
+ruff format src tests
+

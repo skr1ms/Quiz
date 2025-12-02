@@ -1,0 +1,46 @@
+services:
+  backend:
+    image: ${REGISTRY_IMAGE}/backend:${IMAGE_TAG}
+    container_name: fastapi-project
+    ports:
+      - "${BACKEND_PORT}:8081"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-local}
+      - DEBUG=${DEBUG:-false}
+      - BACKEND_PORT=${BACKEND_PORT:-8081}
+      - DB_HOST=postgres
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - API_NINJAS=${API_NINJAS}
+      - API_NINJAS_BASE_URL=${API_NINJAS_BASE_URL:-https://api.api-ninjas.com/v1}
+    networks:
+      - pz1
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    image: ${REGISTRY_IMAGE}/frontend:${IMAGE_TAG}
+    container_name: frontend
+    ports:
+      - "${FRONTEND_PORT:-8000}:80"
+    networks:
+      - pz1
+    depends_on:
+      - backend
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  pz1:
+    name: docker_pz1
+    external: true

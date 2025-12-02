@@ -1,0 +1,173 @@
+include:
+  - .gitlab-deploy.yml
+
+workflow:
+  rules:
+    - if: '$FORCE_BUILD_ALL == "true"'
+      when: always
+    - changes:
+        - "README.md"
+        - "docs/**/*"
+      when: never
+    - when: always
+
+stages:
+  - build
+  - test
+  - deploy
+  - cleanup
+
+variables:
+  FORCE_BUILD_ALL: "false"
+  DOCKER_BUILDKIT: "1"
+  DOCKER_CLI_IMAGE: docker:28.5.0-cli
+  PYTHON_IMAGE: python:3.12-slim
+  POSTGRES_IMAGE: postgres:17-alpine
+  DOCKER_HOST: unix:///var/run/docker.sock
+
+.shared_changes: &shared_changes
+  - .gitlab-ci.yml
+  - .gitlab-deploy.yml
+  - deployment/**/*
+  - backend/config/Dockerfile
+  - backend/pyproject.toml
+  - backend/requirements.txt
+  - backend/Makefile
+
+.backend_changes: &backend_changes
+  - backend/**/*
+
+.frontend_changes: &frontend_changes
+  - frontend/**/*
+
+.default-docker-login:
+  image: $DOCKER_CLI_IMAGE
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+
+# ---------------------------------------------------------------------------
+# Build stage
+# ---------------------------------------------------------------------------
+build:backend:
+  stage: build
+  extends: .default-docker-login
+  script:
+    - |
+      docker pull "$CI_REGISTRY_IMAGE/backend:branch-${CI_COMMIT_REF_SLUG}" || \
+      docker pull "$CI_REGISTRY_IMAGE/backend:latest" || true
+    - |
+      docker build \
+        --cache-from "$CI_REGISTRY_IMAGE/backend:branch-${CI_COMMIT_REF_SLUG}" \
+        --cache-from "$CI_REGISTRY_IMAGE/backend:latest" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t "$CI_REGISTRY_IMAGE/backend:${CI_COMMIT_SHA}" \
+        -t "$CI_REGISTRY_IMAGE/backend:branch-${CI_COMMIT_REF_SLUG}" \
+        -f backend/config/Dockerfile \
+        backend/
+    - docker push "$CI_REGISTRY_IMAGE/backend:${CI_COMMIT_SHA}"
+    - docker push "$CI_REGISTRY_IMAGE/backend:branch-${CI_COMMIT_REF_SLUG}"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag "$CI_REGISTRY_IMAGE/backend:${CI_COMMIT_SHA}" "$CI_REGISTRY_IMAGE/backend:latest"
+        docker push "$CI_REGISTRY_IMAGE/backend:latest"
+      fi
+  rules:
+    - if: '$FORCE_BUILD_ALL == "true"'
+      when: always
+    - changes: *backend_changes
+      when: always
+    - changes: *shared_changes
+      when: always
+    - when: never
+
+build:frontend:
+  stage: build
+  extends: .default-docker-login
+  script:
+    - |
+      docker pull "$CI_REGISTRY_IMAGE/frontend:branch-${CI_COMMIT_REF_SLUG}" || \
+      docker pull "$CI_REGISTRY_IMAGE/frontend:latest" || true
+    - echo "Building with VITE_API_BASE_URL=${VITE_API_BASE_URL}"
+    - |
+      docker build \
+        --cache-from "$CI_REGISTRY_IMAGE/frontend:branch-${CI_COMMIT_REF_SLUG}" \
+        --cache-from "$CI_REGISTRY_IMAGE/frontend:latest" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --build-arg VITE_API_BASE_URL=${VITE_API_BASE_URL} \
+        -t "$CI_REGISTRY_IMAGE/frontend:${CI_COMMIT_SHA}" \
+        -t "$CI_REGISTRY_IMAGE/frontend:branch-${CI_COMMIT_REF_SLUG}" \
+        -f frontend/config/Dockerfile \
+        frontend/
+    - docker push "$CI_REGISTRY_IMAGE/frontend:${CI_COMMIT_SHA}"
+    - docker push "$CI_REGISTRY_IMAGE/frontend:branch-${CI_COMMIT_REF_SLUG}"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag "$CI_REGISTRY_IMAGE/frontend:${CI_COMMIT_SHA}" "$CI_REGISTRY_IMAGE/frontend:latest"
+        docker push "$CI_REGISTRY_IMAGE/frontend:latest"
+      fi
+  rules:
+    - if: '$FORCE_BUILD_ALL == "true"'
+      when: always
+    - changes: *frontend_changes
+      when: always
+    - changes: *shared_changes
+      when: always
+    - when: never
+
+# ---------------------------------------------------------------------------
+# Test stage
+# ---------------------------------------------------------------------------
+test:backend:
+  stage: test
+  image: $PYTHON_IMAGE
+  services:
+    - name: $POSTGRES_IMAGE
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_password
+    POSTGRES_HOST: postgres
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_USER: test_user
+    DB_PASSWORD: test_password
+    DB_NAME: test_db
+    ENVIRONMENT: test
+    API_NINJAS: "test-api-key-for-ci"
+    API_NINJAS_BASE_URL: "https://api.api-ninjas.com/v1"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends bash gcc musl-dev postgresql-client curl
+    - |
+      echo "Waiting for PostgreSQL to be ready..."
+      for i in $(seq 1 30); do
+        PGPASSWORD=$POSTGRES_PASSWORD psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DB -c 'select 1' >/dev/null 2>&1 && echo "PostgreSQL is ready!" && break
+        echo "Attempt $i/30: PostgreSQL not ready, waiting..."
+        sleep 2
+      done
+    - cd backend
+    - pip install --no-cache-dir -r requirements.txt
+    - pip install --no-cache-dir pytest pytest-asyncio httpx
+  script:
+    - pytest tests/ -v
+  rules:
+    - if: '$FORCE_BUILD_ALL == "true"'
+      when: always
+    - changes: *backend_changes
+      when: always
+    - changes: *shared_changes
+      when: always
+    - when: never
+
+# ---------------------------------------------------------------------------
+# Cleanup stage
+# ---------------------------------------------------------------------------
+docker:gc:
+  stage: cleanup
+  image: $DOCKER_CLI_IMAGE
+  script:
+    - docker image prune -af --filter "until=24h" || true
+    - docker builder prune -af --filter "until=24h" || true
+  rules:
+    - when: always
+  allow_failure: true
